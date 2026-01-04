@@ -1,15 +1,14 @@
 """MCP Server for Brazilian Soccer Knowledge Graph."""
 
 from typing import Any, Optional
-from mcp.server import Server
-from mcp.types import Tool, TextContent
-from mcp.server.stdio import stdio_server
+from mcp.server.fastmcp import FastMCP
+from mcp.types import TextContent
 
 from .database import Neo4jDatabase
 
 
 # Initialize the server
-server = Server("brazilian-soccer-kb")
+server = FastMCP("brazilian-soccer-kb")
 
 # Database connection (lazy initialization)
 _db: Optional[Neo4jDatabase] = None
@@ -192,6 +191,68 @@ async def get_player_career(player_id: str) -> list[TextContent]:
     return [TextContent(type="text", text=output)]
 
 
+@server.tool()
+async def get_player_transfers(player_id: str) -> list[TextContent]:
+    """Get the transfer history of a player between teams.
+
+    Args:
+        player_id: The unique player identifier
+    """
+    db = get_db()
+
+    # Get player info
+    player_query = """
+    MATCH (p:Player {player_id: $player_id})
+    RETURN p.name as name, p.nationality as nationality
+    """
+    player_result = db.execute_query(player_query, {"player_id": player_id})
+
+    if not player_result:
+        return [TextContent(type="text", text=f"Player with ID '{player_id}' not found")]
+
+    player = player_result[0]
+
+    # Get transfers (contracts sorted by start date)
+    query = """
+    MATCH (p:Player {player_id: $player_id})-[r:PLAYS_FOR]->(t:Team)
+    RETURN t.team_id as team_id, t.name as team_name, t.city as city,
+           r.start_date as start_date, r.end_date as end_date,
+           r.transfer_fee as transfer_fee, r.transfer_type as transfer_type
+    ORDER BY r.start_date
+    """
+
+    results = db.execute_query(query, {"player_id": player_id})
+
+    output = f"**{player['name']}** Transfer History\n"
+    output += f"Nationality: {player['nationality']}\n\n"
+
+    if not results:
+        output += "No transfer history found."
+    else:
+        output += "**Transfers:**\n"
+        prev_team = None
+        for i, transfer in enumerate(results):
+            if i == 0:
+                output += f"- Joined **{transfer['team_name']}** ({transfer['start_date']})"
+            else:
+                output += f"- **{prev_team}** → **{transfer['team_name']}** ({transfer['start_date']})"
+
+            if transfer.get("transfer_type"):
+                output += f" [{transfer['transfer_type']}]"
+            if transfer.get("transfer_fee"):
+                output += f" - Fee: ${transfer['transfer_fee']:,}"
+            output += "\n"
+
+            if transfer["end_date"]:
+                output += f"  Left: {transfer['end_date']}\n"
+            else:
+                output += f"  Current club\n"
+
+            prev_team = transfer["team_name"]
+
+    return [TextContent(type="text", text=output)]
+
+
 # ============================================================================
 # Team Tools
 # ============================================================================
@@ -356,6 +417,186 @@ async def get_team_stats(team_id: str, season: Optional[str] = None) -> list[Tex
     return [TextContent(type="text", text=output)]
 
 
+@server.tool()
+async def get_team_history(team_id: str) -> list[TextContent]:
+    """Get the historical performance of a team across all competitions.
+
+    Args:
+        team_id: The unique team identifier
+    """
+    db = get_db()
+
+    # Get team info
+    team_query = """
+    MATCH (t:Team {team_id: $team_id})
+    RETURN t.name as name, t.city as city, t.founded_year as founded_year,
+           t.stadium as stadium, t.colors as colors
+    """
+    team_result = db.execute_query(team_query, {"team_id": team_id})
+
+    if not team_result:
+        return [TextContent(type="text", text=f"Team with ID '{team_id}' not found")]
+
+    team = team_result[0]
+
+    output = f"**{team['name']}** History\n\n"
+    output += f"- City: {team['city']}\n"
+    if team["founded_year"]:
+        output += f"- Founded: {team['founded_year']}\n"
+    if team["stadium"]:
+        output += f"- Stadium: {team['stadium']}\n"
+    if team["colors"]:
+        output += f"- Colors: {team['colors']}\n"
+    output += "\n"
+
+    # Get performance by competition
+    competition_query = """
+    MATCH (t:Team {team_id: $team_id})
+    MATCH (t)-[:PLAYED_HOME|PLAYED_AWAY]->(m:Match)-[:PART_OF]->(c:Competition)
+    WITH c, t, m
+    RETURN c.name as competition, c.season as season,
+           count(m) as matches,
+           sum(CASE
+               WHEN (t)-[:PLAYED_HOME]->(m) AND m.home_score > m.away_score THEN 1
+               WHEN (t)-[:PLAYED_AWAY]->(m) AND m.away_score > m.home_score THEN 1
+               ELSE 0
+           END) as wins,
+           sum(CASE WHEN m.home_score = m.away_score THEN 1 ELSE 0 END) as draws,
+           sum(CASE
+               WHEN (t)-[:PLAYED_HOME]->(m) AND m.home_score < m.away_score THEN 1
+               WHEN (t)-[:PLAYED_AWAY]->(m) AND m.away_score < m.home_score THEN 1
+               ELSE 0
+           END) as losses
+    ORDER BY c.season DESC, c.name
+    """
+
+    results = db.execute_query(competition_query, {"team_id": team_id})
+
+    if results:
+        output += "**Competition History:**\n\n"
+        current_comp = None
+        for row in results:
+            if row["competition"] != current_comp:
+                current_comp = row["competition"]
+                output += f"**{current_comp}**\n"
+            points = (row["wins"] or 0) * 3 + (row["draws"] or 0)
+            output += f"  - {row['season']}: {row['matches']} matches, "
+            output += f"{row['wins']}W-{row['draws']}D-{row['losses']}L ({points} pts)\n"
+    else:
+        output += "No competition history found."
+
+    # Get notable achievements (titles, etc.) if stored
+    titles_query = """
+    MATCH (t:Team {team_id: $team_id})-[r:WON]->(c:Competition)
+    RETURN c.name as competition, c.season as season
+    ORDER BY c.season DESC
+    """
+    titles = db.execute_query(titles_query, {"team_id": team_id})
+
+    if titles:
+        output += "\n**Titles:**\n"
+        for title in titles:
+            output += f"- {title['competition']} ({title['season']})\n"
+
+    return [TextContent(type="text", text=output)]
+
+
+# ============================================================================
+# Coach Tools
+# ============================================================================
+
+
+@server.tool()
+async def get_team_coach(team_id: str) -> list[TextContent]:
+    """Get the current coach for a team.
+
+    Args:
+        team_id: The unique team identifier
+    """
+    db = get_db()
+
+    # Get team info
+    team_query = "MATCH (t:Team {team_id: $team_id}) RETURN t.name as name"
+    team_result = db.execute_query(team_query, {"team_id": team_id})
+
+    if not team_result:
+        return [TextContent(type="text", text=f"Team with ID '{team_id}' not found")]
+
+    team_name = team_result[0]["name"]
+
+    # Get current coach
+    query = """
+    MATCH (c:Coach)-[r:MANAGES]->(t:Team {team_id: $team_id})
+    WHERE r.end_date IS NULL OR r.end_date >= date()
+    RETURN c.coach_id as coach_id, c.name as name, c.nationality as nationality,
+           c.birth_date as birth_date, r.start_date as start_date
+    ORDER BY r.start_date DESC
+    LIMIT 1
+    """
+
+    result = db.execute_query(query, {"team_id": team_id})
+
+    output = f"**{team_name}** Current Coach\n\n"
+
+    if not result:
+        output += "No current coach found."
+    else:
+        coach = result[0]
+        output += f"- **{coach['name']}** ({coach['coach_id']})\n"
+        output += f"  Nationality: {coach['nationality']}\n"
+        if coach["birth_date"]:
+            output += f"  Born: {coach['birth_date']}\n"
+        if coach["start_date"]:
+            output += f"  Started: {coach['start_date']}\n"
+
+    return [TextContent(type="text", text=output)]
+
+
+@server.tool()
+async def get_coach_teams(coach_id: str) -> list[TextContent]:
+    """Get teams managed by a coach (current and past).
+
+    Args:
+        coach_id: The unique coach identifier
+    """
+    db = get_db()
+
+    # Get coach info
+    coach_query = """
+    MATCH (c:Coach {coach_id: $coach_id})
+    RETURN c.name as name, c.nationality as nationality
+    """
+    coach_result = db.execute_query(coach_query, {"coach_id": coach_id})
+
+    if not coach_result:
+        return [TextContent(type="text", text=f"Coach with ID '{coach_id}' not found")]
+
+    coach = coach_result[0]
+
+    # Get teams managed
+    query = """
+    MATCH (c:Coach {coach_id: $coach_id})-[r:MANAGES]->(t:Team)
+    RETURN t.team_id as team_id, t.name as team_name, t.city as city,
+           r.start_date as start_date, r.end_date as end_date
+    ORDER BY r.start_date DESC
+    """
+
+    results = db.execute_query(query, {"coach_id": coach_id})
+
+    output = f"**{coach['name']}** Coaching History\n"
+    output += f"Nationality: {coach['nationality']}\n\n"
+
+    if not results:
+        output += "No teams managed."
+    else:
+        output += "**Teams:**\n"
+        for team in results:
+            end = team["end_date"] or "Present"
+            output += f"- {team['team_name']} ({team['city']}): {team['start_date']} to {end}\n"
+
+    return [TextContent(type="text", text=output)]
+
+
 # ============================================================================
 # Match Tools
 # ============================================================================
@@ -373,10 +614,12 @@ async def get_match_details(match_id: str) -> list[TextContent]:
     query = """
     MATCH (home:Team)-[:PLAYED_HOME]->(m:Match {match_id: $match_id})<-[:PLAYED_AWAY]-(away:Team)
     MATCH (m)-[:PART_OF]->(c:Competition)
+    OPTIONAL MATCH (m)-[:PLAYED_AT]->(s:Stadium)
     RETURN m.match_id as match_id, m.date as date, m.home_score as home_score,
            m.away_score as away_score, m.attendance as attendance,
            home.name as home_team, away.name as away_team,
-           c.name as competition, c.season as season
+           c.name as competition, c.season as season,
+           s.name as stadium, s.city as stadium_city, s.capacity as stadium_capacity
     """
 
     result = db.execute_query(query, {"match_id": match_id})
@@ -400,6 +643,13 @@ async def get_match_details(match_id: str) -> list[TextContent]:
     output += f"**{match['home_team']}** {match['home_score']} - {match['away_score']} **{match['away_team']}**\n\n"
     output += f"- Date: {match['date']}\n"
     output += f"- Competition: {match['competition']} ({match['season']})\n"
+    if match["stadium"]:
+        output += f"- Stadium: {match['stadium']}"
+        if match["stadium_city"]:
+            output += f" ({match['stadium_city']})"
+        if match["stadium_capacity"]:
+            output += f" - Capacity: {match['stadium_capacity']:,}"
+        output += "\n"
     if match["attendance"]:
         output += f"- Attendance: {match['attendance']:,}\n"
 
@@ -408,6 +658,64 @@ async def get_match_details(match_id: str) -> list[TextContent]:
         for goal in scorers:
             goal_type = f" ({goal['type']})" if goal["type"] != "regular" else ""
             output += f"- {goal['minute']}' {goal['player']} ({goal['team']}){goal_type}\n"
+
+    return [TextContent(type="text", text=output)]
+
+
+@server.tool()
+async def get_matches_at_stadium(stadium_id: str, limit: int = 20) -> list[TextContent]:
+    """Get matches played at a specific stadium.
+
+    Args:
+        stadium_id: The unique stadium identifier
+        limit: Maximum number of matches to return (default 20)
+    """
+    db = get_db()
+
+    # Get stadium info
+    stadium_query = """
+    MATCH (s:Stadium {stadium_id: $stadium_id})
+    RETURN s.name as name, s.city as city, s.capacity as capacity
+    """
+    stadium_result = db.execute_query(stadium_query, {"stadium_id": stadium_id})
+
+    if not stadium_result:
+        return [TextContent(type="text", text=f"Stadium with ID '{stadium_id}' not found")]
+
+    stadium = stadium_result[0]
+
+    # Get matches at this stadium
+    query = """
+    MATCH (m:Match)-[:PLAYED_AT]->(s:Stadium {stadium_id: $stadium_id})
+    MATCH (home:Team)-[:PLAYED_HOME]->(m)<-[:PLAYED_AWAY]-(away:Team)
+    MATCH (m)-[:PART_OF]->(c:Competition)
+    RETURN m.match_id as match_id, m.date as date, m.home_score as home_score,
+           m.away_score as away_score, m.attendance as attendance,
+           home.name as home_team, away.name as away_team,
+           c.name as competition, c.season as season
+    ORDER BY m.date DESC
+    LIMIT $limit
+    """
+
+    results = db.execute_query(query, {"stadium_id": stadium_id, "limit": limit})
+
+    output = f"**Matches at {stadium['name']}**"
+    if stadium["city"]:
+        output += f" ({stadium['city']})"
+    if stadium["capacity"]:
+        output += f" - Capacity: {stadium['capacity']:,}"
+    output += "\n\n"
+
+    if not results:
+        output += "No matches found at this stadium."
+    else:
+        output += f"Found {len(results)} match(es):\n\n"
+        for match in results:
+            output += f"- **{match['date']}**: {match['home_team']} {match['home_score']}-{match['away_score']} {match['away_team']}\n"
+            output += f"  ({match['competition']} {match['season']})"
+            if match["attendance"]:
+                output += f" - Attendance: {match['attendance']:,}"
+            output += f" [ID: {match['match_id']}]\n\n"
 
     return [TextContent(type="text", text=output)]
 
@@ -612,6 +920,68 @@ async def get_competition_top_scorers(
     return [TextContent(type="text", text=output)]
 
 
+@server.tool()
+async def get_competition_standings(
+    competition_id: str, season: str
+) -> list[TextContent]:
+    """Get the standings/league table for a competition season.
+
+    Args:
+        competition_id: The competition identifier
+        season: The season year (e.g., "2023")
+    """
+    db = get_db()
+
+    # Get competition info
+    comp_query = """
+    MATCH (c:Competition {competition_id: $competition_id, season: $season})
+    RETURN c.name as name, c.type as type
+    """
+    comp_result = db.execute_query(comp_query, {"competition_id": competition_id, "season": season})
+
+    if not comp_result:
+        return [TextContent(type="text", text=f"Competition not found for season {season}")]
+
+    comp = comp_result[0]
+
+    # Calculate standings from match results
+    query = """
+    MATCH (t:Team)-[:PLAYED_HOME|PLAYED_AWAY]->(m:Match)-[:PART_OF]->(c:Competition {competition_id: $competition_id, season: $season})
+    WITH t, m,
+         CASE WHEN (t)-[:PLAYED_HOME]->(m) THEN m.home_score ELSE m.away_score END as goals_for,
+         CASE WHEN (t)-[:PLAYED_HOME]->(m) THEN m.away_score ELSE m.home_score END as goals_against
+    WITH t,
+         count(m) as played,
+         sum(CASE WHEN goals_for > goals_against THEN 1 ELSE 0 END) as wins,
+         sum(CASE WHEN goals_for = goals_against THEN 1 ELSE 0 END) as draws,
+         sum(CASE WHEN goals_for < goals_against THEN 1 ELSE 0 END) as losses,
+         sum(goals_for) as gf,
+         sum(goals_against) as ga
+    RETURN t.team_id as team_id, t.name as team_name,
+           played, wins, draws, losses,
+           gf as goals_for, ga as goals_against,
+           gf - ga as goal_difference,
+           wins * 3 + draws as points
+    ORDER BY points DESC, goal_difference DESC, goals_for DESC
+    """
+
+    results = db.execute_query(query, {"competition_id": competition_id, "season": season})
+
+    output = f"**{comp['name']} ({season}) Standings**\n\n"
+
+    if not results:
+        output += "No standings data available."
+    else:
+        output += "| Pos | Team | P | W | D | L | GF | GA | GD | Pts |\n"
+        output += "|-----|------|---|---|---|---|----|----|-------|-----|\n"
+        for i, team in enumerate(results, 1):
+            output += f"| {i} | {team['team_name']} | {team['played']} | {team['wins']} | "
+            output += f"{team['draws']} | {team['losses']} | {team['goals_for']} | "
+            output += f"{team['goals_against']} | {team['goal_difference']:+d} | {team['points']} |\n"
+
+    return [TextContent(type="text", text=output)]
+
+
 # ============================================================================
 # Analysis Tools
 # ============================================================================
@@ -708,12 +1078,10 @@ async def find_players_who_played_for_both_teams(team1_id: str, team2_id: str) -
     return [TextContent(type="text", text=output)]
 
 
-async def main():
+def main():
     """Run the MCP server."""
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    server.run()
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
